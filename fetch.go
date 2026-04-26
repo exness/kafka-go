@@ -71,7 +71,8 @@ type FetchResponse struct {
 	// PreferredReadReplica is the broker id the broker would prefer the
 	// consumer fetch from for this partition (KIP-392). A value of -1 means
 	// no preference. Only populated when the broker supports Fetch v11 or
-	// above; otherwise it is 0.
+	// above AND the caller set RackID on the request; in any other case
+	// the value is forced to -1.
 	PreferredReadReplica int32
 
 	// An error that may have occurred while attempting to fetch the records.
@@ -186,6 +187,17 @@ func (c *Client) Fetch(ctx context.Context, req *FetchRequest) (*FetchResponse, 
 		LogStartOffset:       partition.LogStartOffset,
 		PreferredReadReplica: partition.PreferredReadReplica,
 		Records:              partition.RecordSet.Records,
+	}
+
+	// KIP-392: PreferredReadReplica is only meaningful in Fetch v11+ responses.
+	// When the broker negotiated an older version, the protocol decoder leaves
+	// the field at Go's zero value (0), which is indistinguishable from broker
+	// id 0 being the preferred replica. We can't read the negotiated version
+	// from here, but we know that if the caller did not set RackID then they
+	// did not opt into KIP-392 and we should not surface any preferred replica
+	// id at all. Force -1 so callers can rely on "-1 means no preference".
+	if req.RackID == "" {
+		ret.PreferredReadReplica = -1
 	}
 
 	if partition.ErrorCode != 0 {

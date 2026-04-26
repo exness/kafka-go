@@ -1414,6 +1414,24 @@ func (r *reader) run(ctx context.Context, offset int64) {
 				continue
 
 			case errors.Is(err, OffsetOutOfRange):
+				// KIP-392: an OffsetOutOfRange from a follower is not
+				// authoritative because follower offsets can lag behind
+				// the leader's. Drop the preference, close the
+				// connection, and let the run loop reinitialize through
+				// the leader on the next iteration. The leader's view of
+				// first/last is the only one we trust for the reset
+				// decision.
+				if r.preferredReadReplica >= 0 {
+					r.withLogger(func(log Logger) {
+						log.Printf("kafka reader got OffsetOutOfRange from preferred replica %d for partition %d of %s, falling back to leader before deciding", r.preferredReadReplica, r.partition, r.topic)
+					})
+					r.preferredReadReplica = -1
+					r.preferredReadReplicaExpiresAt = time.Time{}
+					conn.Close()
+					errcount = 0
+					break readLoop
+				}
+
 				first, last, err := r.readOffsets(conn)
 				if err != nil {
 					r.withErrorLogger(func(log Logger) {
@@ -1553,9 +1571,12 @@ func (r *reader) read(ctx context.Context, offset int64, conn *Conn) (int64, err
 	})
 	highWaterMark := batch.HighWaterMark()
 
-	// KIP-392: if the broker reports a (different) preferred read replica, or
-	// expired our current preference, record it and bail out so that the outer
-	// loop reconnects to the preferred broker on the next initialize().
+	// KIP-392: detect a (different) preferred read replica or expired
+	// preference. Update the cached state, but do NOT abandon the records
+	// the broker just gave us — that response is valid even if the broker
+	// wants us to talk to a different replica next time. We deliver the
+	// records first, then signal the run loop to reconnect.
+	prrChanged := false
 	if prr := batch.PreferredReadReplica(); prr != r.preferredReadReplica {
 		r.preferredReadReplica = prr
 		if prr >= 0 {
@@ -1564,25 +1585,21 @@ func (r *reader) read(ctx context.Context, offset int64, conn *Conn) (int64, err
 			// read replica TTL.
 			r.preferredReadReplicaExpiresAt = time.Now().Add(5 * time.Minute)
 			r.withLogger(func(log Logger) {
-				log.Printf("kafka reader switching to preferred read replica %d for partition %d of %s", prr, r.partition, r.topic)
+				log.Printf("kafka reader switching to preferred read replica %d for partition %d of %s after current batch", prr, r.partition, r.topic)
 			})
 		} else {
 			r.preferredReadReplicaExpiresAt = time.Time{}
 			r.withLogger(func(log Logger) {
-				log.Printf("kafka reader falling back to leader for partition %d of %s", r.partition, r.topic)
+				log.Printf("kafka reader falling back to leader for partition %d of %s after current batch", r.partition, r.topic)
 			})
 		}
-		batch.Close()
-		conn.Close()
-		return offset, errPreferredReadReplicaChanged
-	}
-	// Preferred replica TTL elapsed — go back to leader and re-discover.
-	if r.preferredReadReplica >= 0 && time.Now().After(r.preferredReadReplicaExpiresAt) {
+		prrChanged = true
+	} else if r.preferredReadReplica >= 0 && time.Now().After(r.preferredReadReplicaExpiresAt) {
+		// Preferred replica TTL elapsed — schedule a reconnect to the leader
+		// so we can re-discover whether the preference still applies.
 		r.preferredReadReplica = -1
 		r.preferredReadReplicaExpiresAt = time.Time{}
-		batch.Close()
-		conn.Close()
-		return offset, errPreferredReadReplicaChanged
+		prrChanged = true
 	}
 
 	t1 := time.Now()
@@ -1624,6 +1641,16 @@ func (r *reader) read(ctx context.Context, offset int64, conn *Conn) (int64, err
 	r.stats.readTime.observeDuration(t2.Sub(t1))
 	r.stats.fetchSize.observe(size)
 	r.stats.fetchBytes.observe(bytes)
+
+	// If the broker wants us to switch replicas, reconnect AFTER having
+	// drained the batch. Only override the existing err if it is an
+	// expected end-of-batch signal (io.EOF or RequestTimedOut). Real
+	// errors (context cancellation, send failures, decode/connection
+	// errors) must propagate as-is so the run loop handles them.
+	if prrChanged && (err == nil || errors.Is(err, io.EOF) || errors.Is(err, RequestTimedOut)) {
+		conn.Close()
+		return offset, errPreferredReadReplicaChanged
+	}
 	return offset, err
 }
 
@@ -1733,9 +1760,13 @@ func (r *reader) dialPreferredReplica(ctx context.Context, seed string) (*Conn, 
 		if p.ID != r.partition {
 			continue
 		}
-		// Search leader + replicas + isr for the broker id.
-		candidates := append([]Broker{p.Leader}, p.Replicas...)
-		candidates = append(candidates, p.Isr...)
+		// Only consider replicas that are actually in-sync. The leader is
+		// always in ISR and is a valid fallback target if the broker chose
+		// to point us at it. A broker present in Replicas but absent from
+		// Isr is offline or lagging and unsafe to follower-fetch from --
+		// matches the Java client's behavior of skipping non-online
+		// replicas when applying KIP-392.
+		candidates := append([]Broker{p.Leader}, p.Isr...)
 		for _, b := range candidates {
 			if b.ID == int(r.preferredReadReplica) {
 				// Build a Partition view where the preferred replica is
@@ -1750,7 +1781,7 @@ func (r *reader) dialPreferredReplica(ctx context.Context, seed string) (*Conn, 
 		break
 	}
 	if !found {
-		return nil, fmt.Errorf("preferred replica %d not found in metadata for partition %d of %s", r.preferredReadReplica, r.partition, r.topic)
+		return nil, fmt.Errorf("preferred replica %d not in ISR for partition %d of %s", r.preferredReadReplica, r.partition, r.topic)
 	}
 	return r.dialer.DialPartition(ctx, "tcp", seed, target)
 }
