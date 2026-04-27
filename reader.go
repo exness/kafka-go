@@ -1554,6 +1554,11 @@ func (r *reader) initialize(ctx context.Context, offset int64) (conn *Conn, star
 	for i := 0; i != len(r.brokers) && conn == nil; i++ {
 		broker := r.brokers[i]
 		var first, last int64
+		// onFollower tracks whether the connection we're about to seek on is
+		// a KIP-392 preferred follower. Followers reject ListOffsets with
+		// NotLeaderForPartition, so we must skip the validating ListOffsets
+		// call inside conn.Seek (SeekDontCheck) when seeking on a follower.
+		onFollower := false
 
 		// KIP-392 only specifies that *Fetch* may be served by a follower;
 		// ListOffsets is still leader-only and a follower will reject it
@@ -1596,6 +1601,7 @@ func (r *reader) initialize(ctx context.Context, offset int64) (conn *Conn, star
 				// concrete offset to resume at). Use sentinel values that
 				// are inert in the clamping switch below.
 				first, last = 0, offset+1
+				onFollower = true
 			}
 		} else {
 			t0 := time.Now()
@@ -1643,6 +1649,8 @@ func (r *reader) initialize(ctx context.Context, offset int64) (conn *Conn, star
 					if err != nil {
 						continue
 					}
+				} else {
+					onFollower = true
 				}
 			} else {
 				conn, err = r.dialer.DialLeader(ctx, "tcp", broker, r.topic, r.partition)
@@ -1674,7 +1682,15 @@ func (r *reader) initialize(ctx context.Context, offset int64) (conn *Conn, star
 			log.Printf("the kafka reader for partition %d of %s is seeking to offset %d", r.partition, r.topic, toHumanOffset(offset))
 		})
 
-		if start, err = conn.Seek(offset, SeekAbsolute); err != nil {
+		// On a KIP-392 follower we must NOT issue ListOffsets to validate the
+		// seek — the follower will reject with NotLeaderForPartition. The
+		// offset has already been validated by the leader on the previous
+		// fetch, so use SeekDontCheck.
+		seekFlags := SeekAbsolute
+		if onFollower {
+			seekFlags |= SeekDontCheck
+		}
+		if start, err = conn.Seek(offset, seekFlags); err != nil {
 			conn.Close()
 			conn = nil
 			break
