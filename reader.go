@@ -1397,6 +1397,18 @@ func (r *reader) run(ctx context.Context, offset int64) {
 					log.Printf("failed to read from current broker for partition %d of %s at offset %d: %v", r.partition, r.topic, toHumanOffset(offset), err)
 				})
 
+				// KIP-392: if the error came while connected to a preferred
+				// follower, clear the preference so the next initialize
+				// dials the actual leader instead of looping back to the
+				// same follower.
+				if r.preferredReadReplica >= 0 {
+					r.withLogger(func(log Logger) {
+						log.Printf("kafka reader clearing preferred replica %d for partition %d of %s after NotLeaderForPartition", r.preferredReadReplica, r.partition, r.topic)
+					})
+					r.preferredReadReplica = -1
+					r.preferredReadReplicaExpiresAt = time.Time{}
+				}
+
 				conn.Close()
 
 				// The next call to .initialize will re-establish a connection to the proper
@@ -1527,7 +1539,32 @@ func (r *reader) initialize(ctx context.Context, offset int64) (conn *Conn, star
 		if first, last, err = r.readOffsets(conn); err != nil {
 			conn.Close()
 			conn = nil
-			break
+
+			// KIP-392: if we are connected to a preferred follower and
+			// readOffsets failed (typically NotLeaderForPartition because
+			// the follower cannot serve ListOffset), clear the preference
+			// and retry through the leader on this same broker instead of
+			// giving up entirely.
+			if usePreferred {
+				r.withErrorLogger(func(log Logger) {
+					log.Printf("kafka reader readOffsets failed on preferred replica %d for partition %d of %s, falling back to leader: %v", r.preferredReadReplica, r.partition, r.topic, err)
+				})
+				r.preferredReadReplica = -1
+				r.preferredReadReplicaExpiresAt = time.Time{}
+				usePreferred = false
+
+				conn, err = r.dialer.DialLeader(ctx, "tcp", broker, r.topic, r.partition)
+				if err != nil {
+					continue
+				}
+				if first, last, err = r.readOffsets(conn); err != nil {
+					conn.Close()
+					conn = nil
+					break
+				}
+			} else {
+				break
+			}
 		}
 
 		switch {
