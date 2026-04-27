@@ -1279,6 +1279,21 @@ type reader struct {
 	// our local failure.
 	preferredReadReplicaCooldown map[int32]time.Time
 
+	// connectedToFollower is set by initialize() when the *Conn it just
+	// returned is talking to a KIP-392 preferred follower (as opposed to
+	// the partition leader). read() uses it to disambiguate two semantically
+	// different "PreferredReadReplica = -1" cases in a FetchResponse:
+	//   - From the leader: the broker has revoked the follower preference
+	//     for this client; we should genuinely fall back.
+	//   - From the follower we are already pinned to: the follower has no
+	//     further redirect to suggest (it does not advertise itself as its
+	//     own preference). This is the normal steady-state response and
+	//     must NOT be interpreted as revocation, otherwise we would
+	//     reconnect to the leader on the very first follower fetch and
+	//     immediately get re-redirected back, oscillating until the
+	//     broker's selector eventually stops re-asserting.
+	connectedToFollower bool
+
 	offsetOutOfRangeError bool
 }
 
@@ -1546,6 +1561,11 @@ func (r *reader) run(ctx context.Context, offset int64) {
 }
 
 func (r *reader) initialize(ctx context.Context, offset int64) (conn *Conn, start int64, err error) {
+	// Default to "not on a follower" until a follower-dial succeeds below.
+	// Reset on every initialize() so that a previous follower session that
+	// got torn down doesn't leak state into a leader-only attempt.
+	r.connectedToFollower = false
+
 	// If a preferred read replica was selected (KIP-392) and is still fresh,
 	// try to dial it. On failure (broker unknown, dial error, etc.) we fall
 	// back to the leader.
@@ -1602,6 +1622,7 @@ func (r *reader) initialize(ctx context.Context, offset int64) (conn *Conn, star
 				// are inert in the clamping switch below.
 				first, last = 0, offset+1
 				onFollower = true
+				r.connectedToFollower = true
 			}
 		} else {
 			t0 := time.Now()
@@ -1651,6 +1672,7 @@ func (r *reader) initialize(ctx context.Context, offset int64) (conn *Conn, star
 					}
 				} else {
 					onFollower = true
+					r.connectedToFollower = true
 				}
 			} else {
 				conn, err = r.dialer.DialLeader(ctx, "tcp", broker, r.topic, r.partition)
@@ -1723,16 +1745,32 @@ func (r *reader) read(ctx context.Context, offset int64, conn *Conn) (int64, err
 	// records first, then signal the run loop to reconnect.
 	prrChanged := false
 	if prr := batch.PreferredReadReplica(); prr != r.preferredReadReplica {
-		// If the broker is suggesting a replica we recently saw fail,
-		// ignore the suggestion and stay on the leader. Without this we
-		// would oscillate forever: the broker re-advertises the same id
-		// on every Fetch, and acting on it would just re-trigger the
-		// failure path.
-		if prr >= 0 && r.preferredReplicaInCooldown(prr) {
+		switch {
+		case prr < 0 && r.connectedToFollower && r.preferredReadReplica >= 0 &&
+			time.Now().Before(r.preferredReadReplicaExpiresAt):
+			// We are currently fetching from the preferred follower and it
+			// reported "no further preference" (preferred_read_replica = -1
+			// in the FetchResponse). Followers don't advertise themselves
+			// as their own preference, so this is the steady-state response
+			// and absolutely does NOT mean the leader has revoked our
+			// pinning. Treat it as a heartbeat: refresh the TTL and keep
+			// fetching from the same follower. Without this branch we
+			// would close the connection, reconnect to the leader, get
+			// re-redirected to the same follower, and oscillate every few
+			// hundred milliseconds until the broker's selector eventually
+			// stops re-asserting.
+			r.preferredReadReplicaExpiresAt = time.Now().Add(5 * time.Minute)
+		case prr >= 0 && r.preferredReplicaInCooldown(prr):
+			// If the broker is suggesting a replica we recently saw fail,
+			// ignore the suggestion and stay on the leader. Without this we
+			// would oscillate forever: the broker re-advertises the same id
+			// on every Fetch, and acting on it would just re-trigger the
+			// failure path.
+			//
 			// Treat the suggestion as "no preference" for our purposes.
 			// Do NOT touch r.preferredReadReplica here so that we don't
 			// trip the prrChanged signal on every batch.
-		} else {
+		default:
 			r.preferredReadReplica = prr
 			if prr >= 0 {
 				// Default to 5 minutes — matches Kafka's metadata.max.age.ms default
